@@ -3,6 +3,20 @@
 ### Added
 
 - New `HybridReader` that composes any primary `Reader` with an in-process `DuckDBReader` for staging. `register()` writes to staging; `execute_sql` routes queries that reference registered names to staging and everything else to the primary. Available behind the existing `duckdb` feature.
+- `HybridReader` now caches query results in its staging DuckDB to keep
+  visualization iteration fast across `DRAW`/`SCALE`/`FACET` tweaks. Cache
+  hits are sub-millisecond; entries are evicted by TTL (default 300s) and
+  by an LRU byte-budget (default 512 MB). Tunable via
+  `HybridReader::with_cache_config(...)` and globally disabled with
+  `GGSQL_HYBRID_CACHE_DISABLED=1`. The Jupyter kernel adds a
+  `-- @uncache` meta-command that clears the cache without restarting the
+  session, and the kernel now emits both `application/vnd.vegalite.v5+json`
+  and `v6+json` mime payloads so JupyterLab 4.x (built-in v5 renderer) and
+  nteract / newer Lab extensions (v6 renderer) both display visualizations
+  natively without falling back to embedded HTML.
+- `Reader::clear_cache()` trait method (default `Ok(())`) — readers without
+  a cache inherit it as a no-op; `HybridReader` overrides to drop its
+  cache tables.
 - New `AdbcReader<D: Driver>` for connecting to data sources via
   [ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity), behind
   a new off-by-default `adbc` feature flag. Generic over any concrete
