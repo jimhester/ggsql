@@ -101,14 +101,55 @@ fn format_connection_changed(display_name: &str) -> Value {
 /// Format Vega-Lite visualization as display_data
 fn format_vegalite(spec: String, hints: &RenderHints) -> Value {
     let html = vegalite_html(&spec, hints);
+
+    let spec_value: Value = serde_json::from_str(&spec).unwrap_or_else(|e| {
+        tracing::error!("Failed to parse Vega-Lite JSON: {}", e);
+        json!({"error": "Invalid Vega-Lite JSON"})
+    });
+
+    // Rewrite the spec's $schema to v5 for the v5 mime bundle so clients
+    // that validate the schema URL against the mime version (notably
+    // JupyterLab 4.x's built-in @jupyterlab/vega5-extension) accept it.
+    // The two mime payloads are otherwise identical; ggsql's generated
+    // specs use core Vega-Lite features that are stable across v5 and v6.
+    let mut spec_v5 = spec_value.clone();
+    if let Some(obj) = spec_v5.as_object_mut() {
+        obj.insert(
+            "$schema".to_string(),
+            json!("https://vega.github.io/schema/vega-lite/v5.json"),
+        );
+    }
+
     json!({
         "data": {
+            // Newer native mime bundle. nteract and newer Lab extensions
+            // render this directly. JupyterLab 4.x does NOT have a built-in
+            // v6 renderer and will fall through to the v5 bundle below.
+            "application/vnd.vegalite.v6+json": spec_value,
+
+            // v5 native mime bundle — JupyterLab 4.x has a built-in
+            // renderer for this (no extra extensions, no script execution,
+            // no CDN round-trip). Chosen preferentially over text/html.
+            "application/vnd.vegalite.v5+json": spec_v5,
+
+            // HTML with embedded vega-embed as a last-resort fallback for
+            // clients that lack any native Vega-Lite renderer. Requires
+            // notebook trust because it contains a <script> tag, and
+            // depends on CDN reachability for vega-embed.
             "text/html": html,
+
+            // Text fallback
             "text/plain": "Vega-Lite visualization".to_string()
         },
-        "metadata": {},
-        "transient": {},
-        "output_location": "plot"
+        "metadata": {
+            // Positron-specific routing hint to send output to the Plots
+            // pane. Placed inside `metadata` (not at the top level of the
+            // output object) per Jupyter's notebook format schema — a
+            // top-level `output_location` fails notebook JSON validation
+            // and JupyterLab drops the output silently.
+            "output_location": "plot"
+        },
+        "transient": {}
     })
 }
 
@@ -385,6 +426,30 @@ mod tests {
 
         assert!(display["data"]["text/html"].is_string());
         assert!(display["data"]["text/plain"].is_string());
+    }
+
+    #[test]
+    fn format_vegalite_emits_both_v5_and_v6_mime() {
+        let spec = r#"{"$schema":"https://vega.github.io/schema/vega-lite/v6.json","mark":"point"}"#.to_string();
+        let hints = RenderHints::default();
+        let payload = super::format_vegalite(spec, &hints);
+
+        let data = payload.get("data").expect("payload has data");
+        assert!(
+            data.get("application/vnd.vegalite.v5+json").is_some(),
+            "v5 mime missing"
+        );
+        assert!(
+            data.get("application/vnd.vegalite.v6+json").is_some(),
+            "v6 mime missing"
+        );
+
+        // The v5 payload's $schema must be rewritten to v5.
+        let v5 = data.get("application/vnd.vegalite.v5+json").unwrap();
+        assert_eq!(
+            v5.get("$schema").and_then(|s| s.as_str()),
+            Some("https://vega.github.io/schema/vega-lite/v5.json")
+        );
     }
 
     #[test]
