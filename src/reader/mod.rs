@@ -345,6 +345,9 @@ pub mod adbc;
 #[cfg(feature = "duckdb")]
 pub mod hybrid;
 
+#[cfg(feature = "duckdb")]
+mod hybrid_cache;
+
 pub mod connection;
 pub mod data;
 mod spec;
@@ -632,6 +635,16 @@ pub trait Reader {
             }
         }
         Ok(results)
+    }
+
+    /// Clear any cached query results this reader may hold.
+    ///
+    /// The default returns `Ok(())` — readers without a cache (DuckDB,
+    /// SQLite, ODBC, plain ADBC) inherit it transparently.
+    /// [`HybridReader`](hybrid::HybridReader) overrides it to drop the
+    /// cache tables it manages in its staging DuckDB.
+    fn clear_cache(&self) -> Result<()> {
+        Ok(())
     }
 }
 
