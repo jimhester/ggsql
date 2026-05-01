@@ -286,15 +286,15 @@ mod tests {
 
     #[test]
     fn key_is_stable() {
-        let a = cache_key("quiver+trino://prod", "SELECT 1");
-        let b = cache_key("quiver+trino://prod", "SELECT 1");
+        let a = cache_key("backend://prod", "SELECT 1");
+        let b = cache_key("backend://prod", "SELECT 1");
         assert_eq!(a, b);
     }
 
     #[test]
     fn uri_matters() {
-        let a = cache_key("quiver+trino://prod", "SELECT 1");
-        let b = cache_key("quiver+trino://test", "SELECT 1");
+        let a = cache_key("backend://prod", "SELECT 1");
+        let b = cache_key("backend://test", "SELECT 1");
         assert_ne!(a, b);
     }
 
@@ -364,7 +364,7 @@ mod tests {
         assert!(lookup(&staging, key).unwrap().is_none());
 
         // insert
-        insert_meta(&staging, key, "quiver+trino://prod", "SELECT 1", 1, 128).unwrap();
+        insert_meta(&staging, key, "backend://prod", "SELECT 1", 1, 128).unwrap();
         let entry = lookup(&staging, key).unwrap().unwrap();
         assert_eq!(entry.row_count, 1);
         assert_eq!(entry.byte_estimate, 128);
