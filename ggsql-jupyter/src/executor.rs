@@ -145,6 +145,22 @@ pub fn parse_meta_command(code: &str) -> Option<String> {
         .map(|rest| rest.trim().to_string())
 }
 
+/// The `-- @uncache` meta-command prefix.
+const META_UNCACHE_PREFIX: &str = "-- @uncache";
+
+/// Parse a `-- @uncache` meta-command. Returns `Some(())` if `code`,
+/// after trimming, is exactly the prefix followed only by whitespace.
+pub fn parse_uncache_meta_command(code: &str) -> Option<()> {
+    let trimmed = code.trim();
+    if trimmed.starts_with(META_UNCACHE_PREFIX)
+        && trimmed[META_UNCACHE_PREFIX.len()..].trim().is_empty()
+    {
+        Some(())
+    } else {
+        None
+    }
+}
+
 /// Query executor maintaining persistent database connection
 pub struct QueryExecutor {
     reader: Box<dyn Reader + Send>,
@@ -200,6 +216,12 @@ impl QueryExecutor {
         tracing::debug!("Executing query: {} chars", code.len());
 
         // Check for meta-commands first
+        if parse_uncache_meta_command(code).is_some() {
+            tracing::info!("Meta-command: clearing cache");
+            self.reader.clear_cache()?;
+            return Ok(ExecutionResult::DataFrame(ggsql::DataFrame::empty()));
+        }
+
         if let Some(uri) = parse_meta_command(code) {
             tracing::info!("Meta-command: switching reader to {}", uri);
             self.swap_reader(&uri)?;
@@ -283,6 +305,22 @@ mod tests {
             Some("duckdb://my.db".to_string())
         );
         assert_eq!(parse_meta_command("SELECT 1"), None);
+    }
+
+    #[test]
+    fn uncache_meta_command_parses() {
+        assert_eq!(parse_uncache_meta_command("-- @uncache"), Some(()));
+        assert_eq!(parse_uncache_meta_command("-- @uncache  \n"), Some(()));
+        assert_eq!(parse_uncache_meta_command("SELECT 1"), None);
+    }
+
+    #[test]
+    fn uncache_clears_reader_cache() {
+        let mut ex = QueryExecutor::new().unwrap();
+        // duckdb://memory doesn't have HybridReader; clear_cache is a no-op.
+        // We just assert the dispatch doesn't error.
+        let res = ex.execute("-- @uncache").unwrap();
+        assert!(matches!(res, ExecutionResult::DataFrame(_)));
     }
 
     #[test]
