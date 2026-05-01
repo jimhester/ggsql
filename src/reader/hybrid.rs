@@ -650,11 +650,7 @@ mod tests {
         // within the same millisecond.
         r.execute_sql("SELECT x FROM t").unwrap();
         r.execute_sql("SELECT x FROM t").unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "ttl=0 must always miss"
-        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "ttl=0 must always miss");
     }
 
     #[test]
@@ -737,8 +733,7 @@ mod tests {
         // Run the viz pipeline. This emits the temp-table DDL plus
         // schema/range/data sub-queries, all of which (except the DDL)
         // populate the cache.
-        let viz_query =
-            "SELECT x, y FROM t ORDER BY x\nVISUALISE x AS x, y AS y\nDRAW point";
+        let viz_query = "SELECT x, y FROM t ORDER BY x\nVISUALISE x AS x, y AS y\nDRAW point";
         let _spec = r.execute(viz_query).unwrap();
         let after_viz = calls.load(Ordering::SeqCst);
         assert!(
@@ -751,9 +746,7 @@ mod tests {
         // name (which embeds a process-stable session UUID), so we
         // reconstruct it the same way the pipeline does.
         let global = crate::naming::quote_ident(&crate::naming::global_table());
-        let schema_sql = format!(
-            "SELECT * FROM (SELECT * FROM {global}) AS __schema__ LIMIT 1"
-        );
+        let schema_sql = format!("SELECT * FROM (SELECT * FROM {global}) AS __schema__ LIMIT 1");
         let before_replay = calls.load(Ordering::SeqCst);
         let _ = r.execute_sql(&schema_sql).unwrap();
         assert_eq!(

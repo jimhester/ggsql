@@ -430,7 +430,9 @@ mod tests {
 
     #[test]
     fn format_vegalite_emits_both_v5_and_v6_mime() {
-        let spec = r#"{"$schema":"https://vega.github.io/schema/vega-lite/v6.json","mark":"point"}"#.to_string();
+        let spec =
+            r#"{"$schema":"https://vega.github.io/schema/vega-lite/v6.json","mark":"point"}"#
+                .to_string();
         let hints = RenderHints::default();
         let payload = super::format_vegalite(spec, &hints);
 

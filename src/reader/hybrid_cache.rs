@@ -79,6 +79,13 @@ pub fn cache_table_name(key: &str) -> String {
     format!("__ggsql_cache_{}", key)
 }
 
+/// Mirror of one row in the `__ggsql_cache_meta` table.
+///
+/// Most fields are not read directly by Rust today — they are populated to
+/// give the row a faithful debug representation and to keep a single source
+/// of truth for the schema. Only `fetched_at_epoch_ms` is consulted at
+/// runtime (TTL check); the rest are exercised through SQL.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub cache_key: String,
@@ -115,12 +122,11 @@ pub fn lookup(staging: &DuckDBReader, key: &str) -> Result<Option<CacheEntry>> {
         return Ok(None);
     }
     let get_str = |col: &str| -> Result<String> {
-        let s = df.column(col).map_err(|e| {
-            crate::GgsqlError::ReaderError(format!("cache lookup col {col}: {e}"))
-        })?;
-        let arr = as_str(s).map_err(|e| {
-            crate::GgsqlError::ReaderError(format!("cache lookup str {col}: {e}"))
-        })?;
+        let s = df
+            .column(col)
+            .map_err(|e| crate::GgsqlError::ReaderError(format!("cache lookup col {col}: {e}")))?;
+        let arr = as_str(s)
+            .map_err(|e| crate::GgsqlError::ReaderError(format!("cache lookup str {col}: {e}")))?;
         if arr.is_empty() || arr.is_null(0) {
             Ok(String::new())
         } else {
@@ -128,12 +134,11 @@ pub fn lookup(staging: &DuckDBReader, key: &str) -> Result<Option<CacheEntry>> {
         }
     };
     let get_i64 = |col: &str| -> Result<i64> {
-        let s = df.column(col).map_err(|e| {
-            crate::GgsqlError::ReaderError(format!("cache lookup col {col}: {e}"))
-        })?;
-        let arr = as_i64(s).map_err(|e| {
-            crate::GgsqlError::ReaderError(format!("cache lookup i64 {col}: {e}"))
-        })?;
+        let s = df
+            .column(col)
+            .map_err(|e| crate::GgsqlError::ReaderError(format!("cache lookup col {col}: {e}")))?;
+        let arr = as_i64(s)
+            .map_err(|e| crate::GgsqlError::ReaderError(format!("cache lookup i64 {col}: {e}")))?;
         if arr.is_empty() || arr.is_null(0) {
             Ok(0)
         } else {
@@ -191,10 +196,7 @@ pub fn touch(staging: &DuckDBReader, key: &str) -> Result<()> {
 }
 
 pub fn drop_entry(staging: &DuckDBReader, key: &str) -> Result<()> {
-    let del = format!(
-        "DELETE FROM {META_TABLE} WHERE cache_key = '{}'",
-        esc(key)
-    );
+    let del = format!("DELETE FROM {META_TABLE} WHERE cache_key = '{}'", esc(key));
     staging.execute_sql(&del)?;
     let drop = format!("DROP TABLE IF EXISTS {}", cache_table_name(key));
     staging.execute_sql(&drop).map(|_| ())
@@ -202,16 +204,13 @@ pub fn drop_entry(staging: &DuckDBReader, key: &str) -> Result<()> {
 
 pub fn clear_all(staging: &DuckDBReader) -> Result<()> {
     // Find all cache_keys; drop each entry.
-    let df = staging.execute_sql(&format!(
-        "SELECT cache_key FROM {META_TABLE}"
-    ))?;
+    let df = staging.execute_sql(&format!("SELECT cache_key FROM {META_TABLE}"))?;
     if df.height() > 0 {
-        let col = df.column("cache_key").map_err(|e| {
-            crate::GgsqlError::ReaderError(format!("clear_all col: {e}"))
-        })?;
-        let s = as_str(col).map_err(|e| {
-            crate::GgsqlError::ReaderError(format!("clear_all str: {e}"))
-        })?;
+        let col = df
+            .column("cache_key")
+            .map_err(|e| crate::GgsqlError::ReaderError(format!("clear_all col: {e}")))?;
+        let s = as_str(col)
+            .map_err(|e| crate::GgsqlError::ReaderError(format!("clear_all str: {e}")))?;
         // Collect keys first to avoid holding borrow during drop_entry mutations.
         let keys: Vec<String> = (0..s.len())
             .filter(|&i| !s.is_null(i))
@@ -232,9 +231,8 @@ pub fn evict_over_budget(staging: &DuckDBReader, max_bytes: u64) -> Result<()> {
     // Cast SUM result to BIGINT — DuckDB's SUM over BIGINT promotes to HUGEINT,
     // which the arrow adapter materializes as Float64 (or unsupported type)
     // and would silently break the i64 extractor below.
-    let sum_sql = format!(
-        "SELECT CAST(COALESCE(SUM(byte_estimate), 0) AS BIGINT) AS n FROM {META_TABLE}"
-    );
+    let sum_sql =
+        format!("SELECT CAST(COALESCE(SUM(byte_estimate), 0) AS BIGINT) AS n FROM {META_TABLE}");
     loop {
         let df = staging.execute_sql(&sum_sql)?;
         let total = df
