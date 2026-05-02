@@ -757,3 +757,239 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "sqlite", feature = "adbc"))]
+mod cache_equivalence_tests {
+    //! Cache equivalence tests against a real ADBC SQLite primary reader.
+    //!
+    //! Drives `HybridReader` with `AdbcReader<sqlite via ManagedDriver>` as
+    //! the primary and a local in-memory DuckDB as staging. Verifies that
+    //! the cache returns correct data on miss and on hit, that hits avoid
+    //! round-tripping back to the primary, and that `clear_cache()` /
+    //! `ttl=0` correctly force re-fetches. The mirror image of the
+    //! per-staged-data assertions in `super::tests`, but with a real
+    //! external-backend primary instead of an in-process `DuckDBReader`.
+    //!
+    //! Skipped by default (each test is `#[ignore]`). To run them:
+    //!
+    //! 1. Install dbc: `curl -LsSf https://dbc.columnar.tech/install.sh | sh`
+    //! 2. Install the SQLite driver: `dbc install sqlite`
+    //! 3. Run: `cargo test --features "adbc duckdb sqlite" -- --ignored cache_equivalence`
+    //!
+    //! `dbc install` writes the driver to a manifest location that
+    //! `ManagedDriver::load_from_name("sqlite", ...)` discovers automatically
+    //! (on macOS: `~/Library/Application Support/ADBC/Drivers/sqlite.toml`).
+
+    use super::HybridReader;
+    use crate::reader::hybrid_cache::CacheConfig;
+    use crate::reader::sqlite::SqliteDialect;
+    use crate::reader::{AdbcReader, DuckDBReader, Reader, Spec, SqlDialect};
+    use crate::{DataFrame, Result};
+    use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
+    use adbc_core::LOAD_FLAG_DEFAULT;
+    use adbc_driver_manager::ManagedDriver;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    /// Construct an `AdbcReader<ManagedDriver>` pointed at a SQLite file via
+    /// the `adbc_driver_sqlite` shared library installed by `dbc`.
+    fn make_adbc_reader(db_path: &str) -> AdbcReader<ManagedDriver> {
+        let driver = ManagedDriver::load_from_name(
+            "sqlite",
+            None,
+            AdbcVersion::V110,
+            LOAD_FLAG_DEFAULT,
+            None,
+        )
+        .expect("`dbc install sqlite` first; see module docs");
+        let dialect: Box<dyn SqlDialect + Send> = Box::new(SqliteDialect);
+        AdbcReader::new_with_database_opts(
+            driver,
+            dialect,
+            std::iter::once((
+                OptionDatabase::Uri,
+                OptionValue::String(format!("file:{}", db_path)),
+            )),
+        )
+        .expect("construct AdbcReader<sqlite>")
+    }
+
+    /// A wrapper around `AdbcReader<ManagedDriver>` that counts every
+    /// `execute_sql` call. Used to assert that cache hits do NOT round-trip
+    /// back to the ADBC primary.
+    struct CountingAdbcReader {
+        inner: AdbcReader<ManagedDriver>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Reader for CountingAdbcReader {
+        fn execute_sql(&self, sql: &str) -> Result<DataFrame> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.execute_sql(sql)
+        }
+        fn register(&self, name: &str, df: DataFrame, replace: bool) -> Result<()> {
+            self.inner.register(name, df, replace)
+        }
+        fn unregister(&self, name: &str) -> Result<()> {
+            self.inner.unregister(name)
+        }
+        fn execute(&self, query: &str) -> Result<Spec> {
+            crate::reader::execute_with_reader(self, query)
+        }
+        fn dialect(&self) -> &dyn SqlDialect {
+            self.inner.dialect()
+        }
+    }
+
+    /// Seed the SQLite file with a small test table via the ADBC reader's
+    /// `register()` (the bulk-ingest path). Done with a bare AdbcReader so
+    /// the seed doesn't show up in any later call counters.
+    fn seed(path: &str) {
+        let bare = make_adbc_reader(path);
+        let df = crate::df! {
+            "x" => vec![1i64, 2, 3, 4, 5],
+            "y" => vec![10i64, 20, 30, 40, 50],
+        }
+        .unwrap();
+        bare.register("t", df, false).unwrap();
+    }
+
+    /// Compare two DataFrames by per-column Arrow array contents. Mirrors
+    /// the helper in `adbc::equivalence_tests`, scoped down to the
+    /// dimensions PR3 cares about.
+    fn assert_dataframes_equal(a: &DataFrame, b: &DataFrame, ctx: &str) {
+        assert_eq!(a.height(), b.height(), "{ctx}: row count");
+        assert_eq!(a.width(), b.width(), "{ctx}: col count");
+        for f in a.schema().fields() {
+            assert_eq!(
+                a.column(f.name()).unwrap().as_ref(),
+                b.column(f.name()).unwrap().as_ref(),
+                "{ctx}: column '{}' mismatch",
+                f.name()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_cache_returns_same_data_as_bare_adbc() {
+        // First call (miss) AND second call (hit) must both return data
+        // identical to a bare AdbcReader. Validates that the
+        // miss → register-in-staging → return-fresh path doesn't corrupt
+        // data, and the hit → SELECT-from-staging path returns a faithful
+        // copy.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let bare = make_adbc_reader(path);
+        let sql = "SELECT x, y, x*y AS xy FROM t WHERE y > 15 ORDER BY x";
+        let golden = bare.execute_sql(sql).unwrap();
+
+        let primary = make_adbc_reader(path);
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(primary), staging);
+
+        let miss = r.execute_sql(sql).unwrap();
+        assert_dataframes_equal(&golden, &miss, "first call (cache miss)");
+
+        let hit = r.execute_sql(sql).unwrap();
+        assert_dataframes_equal(&golden, &hit, "second call (cache hit)");
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_cache_hit_avoids_adbc_call() {
+        // Counter-based assertion: identical query twice → ADBC reached
+        // exactly once. The cache-hit path must serve from staging without
+        // touching the primary.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let primary = make_adbc_reader(path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingAdbcReader {
+            inner: primary,
+            calls: calls.clone(),
+        };
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        let sql = "SELECT x FROM t ORDER BY x";
+        r.execute_sql(sql).unwrap();
+        r.execute_sql(sql).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second call must hit cache, not ADBC"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_clear_cache_forces_adbc_refetch() {
+        // After clear_cache(), the next query must round-trip back to ADBC
+        // — proving clear_cache actually drops cache state, not just meta
+        // rows.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let primary = make_adbc_reader(path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingAdbcReader {
+            inner: primary,
+            calls: calls.clone(),
+        };
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        let sql = "SELECT x FROM t";
+        r.execute_sql(sql).unwrap(); // miss → 1
+        r.execute_sql(sql).unwrap(); // hit  → still 1
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        r.clear_cache().unwrap();
+        r.execute_sql(sql).unwrap(); // miss again → 2
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "clear_cache must force re-fetch from ADBC"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_ttl_zero_always_hits_adbc() {
+        // ttl=0 must always evict + refetch, even within the same
+        // millisecond. Each call must reach ADBC.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let primary = make_adbc_reader(path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingAdbcReader {
+            inner: primary,
+            calls: calls.clone(),
+        };
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let cfg = CacheConfig {
+            enabled: true,
+            ttl_secs: 0,
+            max_bytes: 1 << 30,
+        };
+        let r = HybridReader::with_cache_config(Box::new(counting), staging, cfg);
+
+        let sql = "SELECT x FROM t";
+        r.execute_sql(sql).unwrap();
+        r.execute_sql(sql).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "ttl=0 must always hit ADBC"
+        );
+    }
+}
