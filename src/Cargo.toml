@@ -52,6 +52,9 @@ rand.workspace = true
 sprintf = "0.4"
 const_format.workspace = true
 uuid.workspace = true
+sha2 = "0.10"
+hex = "0.4"
+tracing.workspace = true
 
 [dev-dependencies]
 jsonschema = { version = "0.44", default-features = false, features = ["resolve-file"] }

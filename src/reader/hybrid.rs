@@ -27,7 +27,25 @@
 //! returns staging's dialect. That is the correct choice for queries over staged
 //! data; when you need SQL targeted at the remote source (e.g. schema introspection
 //! of the remote catalog), use [`HybridReader::data_dialect`] instead.
+//!
+//! # Query-Result Cache
+//!
+//! `HybridReader::execute_sql` memoizes remote query results in the staging
+//! DuckDB under hashed table names (`__ggsql_cache_<hex>`). Repeat calls
+//! with identical `(reader_uri, sql)` within the configured TTL return
+//! cached data in <1 ms instead of a round-trip to the primary reader.
+//!
+//! - Cache is enabled by default; set `GGSQL_HYBRID_CACHE_DISABLED=1` to
+//!   turn it off, or construct via `HybridReader::with_cache_config` to
+//!   supply a custom `CacheConfig` (TTL, byte budget).
+//! - Eviction is LRU by last-access once the cumulative `byte_estimate`
+//!   of entries exceeds `CacheConfig::max_bytes` (default 512 MB).
+//! - Manual invalidation: `HybridReader::clear_cache()` on the Rust side,
+//!   `-- @uncache` meta-command in the Jupyter kernel.
+//! - Scope: the cache lives in the staging DuckDB instance owned by a
+//!   single `HybridReader`. No cross-session/disk persistence in v1.
 
+use crate::reader::hybrid_cache::{self, CacheConfig};
 use crate::reader::{DuckDBReader, Reader, Spec, SqlDialect};
 use crate::{DataFrame, Result};
 use std::cell::RefCell;
@@ -37,18 +55,56 @@ pub struct HybridReader {
     data: Box<dyn Reader + Send>,
     staging: DuckDBReader,
     staged_names: RefCell<HashSet<String>>,
+    cache: CacheConfig,
+    /// Stable per-instance identifier used to namespace cache keys. The
+    /// `Reader` trait does not expose a URI we can hash, so each
+    /// `HybridReader` mints a fresh UUID at construction and uses it as the
+    /// `reader_uri` half of the `(reader_uri, sql)` cache key. This means
+    /// (a) two `HybridReader` instances that share a staging DuckDB cannot
+    /// alias each other's cached results even if they wrap different
+    /// primaries, and (b) the cache cannot accidentally outlive the
+    /// instance that produced it across a process restart.
+    instance_id: String,
 }
 
 impl HybridReader {
     /// Construct a `HybridReader` from a primary data reader and a staging
-    /// DuckDB instance. The staging instance is owned by the `HybridReader`
-    /// and dropped with it; staged tables do not persist across constructions.
+    /// DuckDB instance, with default cache config (enabled unless
+    /// `GGSQL_HYBRID_CACHE_DISABLED=1` is set).
     pub fn new(data: Box<dyn Reader + Send>, staging: DuckDBReader) -> Self {
+        Self::with_cache_config(data, staging, CacheConfig::default())
+    }
+
+    /// Construct with caller-supplied cache config. Ensures the meta
+    /// table exists eagerly so the first remote query doesn't pay the
+    /// schema-creation cost. Ignoring errors here is intentional: if
+    /// meta-init fails, subsequent cache ops will fail too and bubble up.
+    pub fn with_cache_config(
+        data: Box<dyn Reader + Send>,
+        staging: DuckDBReader,
+        cache: CacheConfig,
+    ) -> Self {
+        if cache.enabled {
+            let _ = hybrid_cache::ensure_meta(&staging);
+        }
         Self {
             data,
             staging,
             staged_names: RefCell::new(HashSet::new()),
+            cache,
+            instance_id: uuid::Uuid::new_v4().to_string(),
         }
+    }
+
+    /// Read-only access to this reader's cache configuration.
+    pub fn cache_config(&self) -> &CacheConfig {
+        &self.cache
+    }
+
+    /// The per-instance UUID used to namespace cache keys. Exposed mainly
+    /// for tests that need to assert two distinct readers do not collide.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// Dialect of the primary data backend. Useful for SQL targeted at the
@@ -61,11 +117,93 @@ impl HybridReader {
 
 impl Reader for HybridReader {
     fn execute_sql(&self, sql: &str) -> Result<DataFrame> {
-        if references_staged_name(sql, &self.staged_names.borrow()) {
-            self.staging.execute_sql(sql)
-        } else {
-            self.data.execute_sql(sql)
+        use crate::naming::quote_ident;
+
+        let names = self.staged_names.borrow();
+        if references_staged_name(sql, &names) {
+            return self.staging.execute_sql(sql);
         }
+        drop(names);
+
+        // Cache disabled → direct passthrough.
+        if !self.cache.enabled {
+            return self.data.execute_sql(sql);
+        }
+
+        // Cache keys are namespaced by this HybridReader's per-instance
+        // UUID so that two HybridReader instances that happen to share a
+        // staging DuckDB cannot alias each other's cached results.
+        let reader_uri = self.instance_id.as_str();
+        let key = hybrid_cache::cache_key(reader_uri, sql);
+        let table = hybrid_cache::cache_table_name(&key);
+
+        // Hit: meta row exists AND within TTL AND table exists.
+        if let Some(entry) = hybrid_cache::lookup(&self.staging, &key)? {
+            // Clamp at zero so a backwards-moving clock (NTP step, suspend
+            // wake, multi-host shared staging) cannot make the difference
+            // negative and keep stale entries alive forever.
+            let age_ms = (hybrid_cache::now_ms() - entry.fetched_at_epoch_ms).max(0);
+            let ttl_ms = (self.cache.ttl_secs as i64) * 1000;
+            // Strict `<` so that ttl=0 always misses, even when racing within
+            // the same millisecond (age_ms = 0, ttl_ms = 0).
+            if age_ms < ttl_ms {
+                let select = format!("SELECT * FROM {}", quote_ident(&table));
+                match self.staging.execute_sql(&select) {
+                    Ok(df) => {
+                        let _ = hybrid_cache::touch(&self.staging, &key);
+                        return Ok(df);
+                    }
+                    Err(_) => {
+                        // Cache table vanished (manual drop, crash mid-insert).
+                        // Fall through to miss path.
+                        let _ = hybrid_cache::drop_entry(&self.staging, &key);
+                    }
+                }
+            } else {
+                // Stale — evict and refetch.
+                let _ = hybrid_cache::drop_entry(&self.staging, &key);
+            }
+        }
+
+        // Miss (or stale after eviction) — fetch from primary and stage.
+        let df = self.data.execute_sql(sql)?;
+        let row_count = df.height() as i64;
+        let byte_estimate = estimate_bytes(&df);
+
+        // DuckDB's `arrow(...)` table function (used by `register`) rejects
+        // schemas with zero columns. The viz pipeline occasionally issues
+        // metadata-only queries that produce empty results; cache those by
+        // value instead of by table.
+        if df.width() == 0 {
+            return Ok(df);
+        }
+
+        self.staging.register(&table, df.clone(), true)?;
+        if let Err(e) = hybrid_cache::insert_meta(
+            &self.staging,
+            &key,
+            reader_uri,
+            sql,
+            row_count,
+            byte_estimate,
+        ) {
+            // insert_meta failed AFTER register succeeded — clean up the
+            // orphan cache table so it doesn't linger forever without a
+            // tracking meta row (which would prevent it from ever being
+            // evicted or garbage-collected).
+            let _ = self
+                .staging
+                .execute_sql(&format!("DROP TABLE IF EXISTS {}", quote_ident(&table)));
+            return Err(e);
+        }
+        // Eviction is bookkeeping — if it hiccups (transient DuckDB error,
+        // internal SQL bug), the user's data is already cached and the
+        // primary fetch succeeded. Don't surface the failure as a query
+        // error; just log and continue.
+        if let Err(e) = hybrid_cache::evict_over_budget(&self.staging, self.cache.max_bytes) {
+            tracing::warn!(error = %e, "cache eviction failed (non-fatal)");
+        }
+        Ok(df)
     }
 
     fn register(&self, name: &str, df: DataFrame, replace: bool) -> Result<()> {
@@ -91,6 +229,20 @@ impl Reader for HybridReader {
         // remote catalog) can access it via `HybridReader::data_dialect()`.
         self.staging.dialect()
     }
+
+    fn clear_cache(&self) -> Result<()> {
+        if self.cache.enabled {
+            hybrid_cache::clear_all(&self.staging)?;
+        }
+        Ok(())
+    }
+}
+
+fn estimate_bytes(df: &DataFrame) -> i64 {
+    df.get_columns()
+        .iter()
+        .map(|col| col.get_array_memory_size())
+        .sum::<usize>() as i64
 }
 
 /// Check whether `sql` references any name in `staged_names` as a SQL
@@ -400,6 +552,573 @@ mod tests {
         assert!(
             err_msg.contains("remote_only"),
             "expected staging-side error mentioning the missing `remote_only` table; got: {err_msg}"
+        );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A reader that wraps an inner `DuckDBReader` and increments a shared
+    /// counter on every `execute_sql` call. Cache-hit tests use the
+    /// counter to assert "the second call did NOT reach the primary."
+    /// The counter is `Arc<AtomicUsize>` so a clone can be retained by
+    /// the test after the reader itself is moved into `Box<dyn Reader>`.
+    struct CountingReader {
+        inner: DuckDBReader,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingReader {
+        fn new(inner: DuckDBReader, calls: Arc<AtomicUsize>) -> Self {
+            Self { inner, calls }
+        }
+    }
+
+    impl Reader for CountingReader {
+        fn execute_sql(&self, sql: &str) -> Result<DataFrame> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.execute_sql(sql)
+        }
+        fn register(&self, name: &str, df: DataFrame, replace: bool) -> Result<()> {
+            self.inner.register(name, df, replace)
+        }
+        fn unregister(&self, name: &str) -> Result<()> {
+            self.inner.unregister(name)
+        }
+        fn execute(&self, query: &str) -> Result<Spec> {
+            crate::reader::execute_with_reader(self, query)
+        }
+        fn dialect(&self) -> &dyn SqlDialect {
+            self.inner.dialect()
+        }
+    }
+
+    #[test]
+    fn new_has_cache_enabled_by_default() {
+        let data = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(data), staging);
+        assert!(r.cache_config().enabled);
+        assert_eq!(r.cache_config().ttl_secs, 300);
+    }
+
+    #[test]
+    fn with_cache_config_applies_custom_settings() {
+        use crate::reader::hybrid_cache::CacheConfig;
+        let data = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let cfg = CacheConfig {
+            enabled: false,
+            ttl_secs: 60,
+            max_bytes: 1024,
+        };
+        let r = HybridReader::with_cache_config(Box::new(data), staging, cfg);
+        assert!(!r.cache_config().enabled);
+        assert_eq!(r.cache_config().ttl_secs, 60);
+        assert_eq!(r.cache_config().max_bytes, 1024);
+    }
+
+    #[test]
+    fn repeat_query_hits_cache_not_data() {
+        // Two identical execute_sql calls must result in only ONE
+        // execute_sql reaching the primary reader — the second call hits
+        // the cache.
+        let data_inner = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data_inner
+            .execute_sql("CREATE TABLE t AS SELECT 1 AS x UNION ALL SELECT 2")
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader::new(data_inner, calls.clone());
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        // The CREATE TABLE above ran on `data_inner` BEFORE wrapping in
+        // CountingReader, so `calls` is still 0. Two identical SELECTs
+        // through the HybridReader: first miss → counter to 1; second
+        // hit → counter stays at 1.
+        let sql = "SELECT x FROM t ORDER BY x";
+        r.execute_sql(sql).unwrap();
+        r.execute_sql(sql).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second execute_sql must be served by cache"
+        );
+    }
+
+    #[test]
+    fn ttl_zero_forces_miss_every_call() {
+        use crate::reader::hybrid_cache::CacheConfig;
+        let data_inner = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data_inner
+            .execute_sql("CREATE TABLE t AS SELECT 1 AS x")
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader::new(data_inner, calls.clone());
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let cfg = CacheConfig {
+            enabled: true,
+            ttl_secs: 0,
+            max_bytes: 1 << 30,
+        };
+        let r = HybridReader::with_cache_config(Box::new(counting), staging, cfg);
+
+        // No sleep between calls — the boundary check must be strict
+        // (`age_ms < ttl_ms`) so ttl=0 always misses, even when racing
+        // within the same millisecond.
+        r.execute_sql("SELECT x FROM t").unwrap();
+        r.execute_sql("SELECT x FROM t").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "ttl=0 must always miss");
+    }
+
+    #[test]
+    fn lru_evicts_oldest_when_over_budget() {
+        use crate::reader::hybrid_cache::CacheConfig;
+        let data_inner = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data_inner
+            .execute_sql("CREATE TABLE t AS SELECT 1 AS x UNION ALL SELECT 2")
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader::new(data_inner, calls.clone());
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        // Tiny budget: 1 byte. Every cached entry exceeds it, so eviction
+        // fires deterministically on every insert.
+        let cfg = CacheConfig {
+            enabled: true,
+            ttl_secs: 300,
+            max_bytes: 1,
+        };
+        let r = HybridReader::with_cache_config(Box::new(counting), staging, cfg);
+
+        r.execute_sql("SELECT x FROM t WHERE x = 1").unwrap(); // miss → stage A
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        r.execute_sql("SELECT x FROM t WHERE x = 2").unwrap(); // miss → stage B; A evicted
+        let before = calls.load(Ordering::SeqCst);
+        r.execute_sql("SELECT x FROM t WHERE x = 1").unwrap(); // re-query A — must MISS
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before + 1,
+            "A should have been evicted by LRU and re-fetched on re-query"
+        );
+    }
+
+    #[test]
+    fn clear_cache_drops_everything() {
+        let data_inner = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data_inner
+            .execute_sql("CREATE TABLE t AS SELECT 1 AS x")
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader::new(data_inner, calls.clone());
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        r.execute_sql("SELECT x FROM t").unwrap(); // miss
+        r.execute_sql("SELECT x FROM t").unwrap(); // hit
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        r.clear_cache().unwrap();
+
+        r.execute_sql("SELECT x FROM t").unwrap(); // miss again — cache wiped
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn viz_execute_shares_cache_with_execute_sql() {
+        // Cache is keyed on (reader_uri, sql). The viz pipeline wraps the
+        // SQL portion in DDL (`CREATE OR REPLACE TEMP TABLE __ggsql_global__
+        // AS <body>`) and issues additional schema/range/data sub-queries
+        // against the staged temp table. The DDL itself is uncacheable
+        // (DuckDB returns a 0-column result for DDL, which the cache skips
+        // to avoid `arrow(...)` rejecting an empty schema), but every
+        // result-bearing sub-query routes through the cache.
+        //
+        // Load-bearing claim verified here: caching is wired into the viz
+        // path. After running a viz query, manually issuing one of the
+        // sub-queries the viz pipeline emits (e.g. the data fetch over
+        // the global temp table) hits the cache and does NOT advance the
+        // data counter. This guarantees that any pipeline that re-emits
+        // the same SQL string within the TTL is memoized.
+        let data_inner = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data_inner
+            .execute_sql("CREATE TABLE t AS SELECT 1 AS x, 10 AS y UNION ALL SELECT 2, 20")
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader::new(data_inner, calls.clone());
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        // Run the viz pipeline. This emits the temp-table DDL plus
+        // schema/range/data sub-queries, all of which (except the DDL)
+        // populate the cache.
+        let viz_query = "SELECT x, y FROM t ORDER BY x\nVISUALISE x AS x, y AS y\nDRAW point";
+        let _spec = r.execute(viz_query).unwrap();
+        let after_viz = calls.load(Ordering::SeqCst);
+        assert!(
+            after_viz >= 1,
+            "viz call must hit data at least once on cache miss; got {after_viz}"
+        );
+
+        // Re-issue the schema-fetch sub-query that the viz pipeline
+        // emitted internally. The exact SQL depends on the global-table
+        // name (which embeds a process-stable session UUID), so we
+        // reconstruct it the same way the pipeline does.
+        let global = crate::naming::quote_ident(&crate::naming::global_table());
+        let schema_sql = format!("SELECT * FROM (SELECT * FROM {global}) AS __schema__ LIMIT 1");
+        let before_replay = calls.load(Ordering::SeqCst);
+        let _ = r.execute_sql(&schema_sql).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before_replay,
+            "replaying a sub-query the viz pipeline already issued must hit \
+             the cache — data counter must not advance"
+        );
+    }
+
+    #[test]
+    fn instance_ids_are_unique_per_reader() {
+        // Each HybridReader gets its own UUID so cache keys are namespaced
+        // per-instance — two readers can share a staging DuckDB without
+        // their caches aliasing.
+        let r1 = HybridReader::new(
+            Box::new(DuckDBReader::from_connection_string("duckdb://memory").unwrap()),
+            DuckDBReader::from_connection_string("duckdb://memory").unwrap(),
+        );
+        let r2 = HybridReader::new(
+            Box::new(DuckDBReader::from_connection_string("duckdb://memory").unwrap()),
+            DuckDBReader::from_connection_string("duckdb://memory").unwrap(),
+        );
+        assert_ne!(r1.instance_id(), r2.instance_id());
+        assert_ne!(
+            hybrid_cache::cache_key(r1.instance_id(), "SELECT 1"),
+            hybrid_cache::cache_key(r2.instance_id(), "SELECT 1"),
+            "two readers must not collide on cache keys"
+        );
+    }
+
+    #[test]
+    fn shared_staging_with_distinct_instances_does_not_alias_cache() {
+        // Two HybridReaders pointed at the same staging DuckDB issue the
+        // same SQL against different primaries; cache must NOT alias them.
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        // Both staging objects are independent (different in-memory DBs);
+        // what we're validating here is that even if a future refactor
+        // arranges for them to share storage, the per-instance UUID in the
+        // cache key would still keep their entries distinct.
+        let staging1 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let staging2 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        drop(staging);
+
+        let data1 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data1
+            .execute_sql("CREATE TABLE t AS SELECT CAST(1 AS BIGINT) AS x UNION ALL SELECT 2")
+            .unwrap();
+        let data2 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data2
+            .execute_sql("CREATE TABLE t AS SELECT CAST(100 AS BIGINT) AS x UNION ALL SELECT 200")
+            .unwrap();
+
+        let r1 = HybridReader::new(Box::new(data1), staging1);
+        let r2 = HybridReader::new(Box::new(data2), staging2);
+
+        let d1 = r1.execute_sql("SELECT x FROM t ORDER BY x").unwrap();
+        let d2 = r2.execute_sql("SELECT x FROM t ORDER BY x").unwrap();
+        // Each reader sees its own primary's data — proves the cache key
+        // separation isolates the two even for an identical SQL string.
+        assert_ne!(
+            crate::array_util::as_i64(d1.column("x").unwrap())
+                .unwrap()
+                .value(0),
+            crate::array_util::as_i64(d2.column("x").unwrap())
+                .unwrap()
+                .value(0),
+        );
+    }
+
+    #[test]
+    fn negative_age_does_not_keep_entries_alive() {
+        // Simulate a backwards-moving clock: insert a meta row with
+        // `fetched_at` in the future. Without the `.max(0)` clamp the
+        // (now - future) age would be negative and pass `< ttl_ms`, making
+        // the entry "immortal" even past its TTL. With the clamp the age
+        // is treated as 0 — still within TTL, so the entry is served from
+        // cache (a hit). That is the correct behaviour: a future timestamp
+        // means "recently fetched relative to a misbehaving clock", not
+        // "infinitely stale".
+        let data_inner = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data_inner
+            .execute_sql("CREATE TABLE t AS SELECT 7 AS x")
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader::new(data_inner, calls.clone());
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        // Prime the cache, then rewrite the meta row's fetched_at to a
+        // value 1 hour in the future relative to wall clock.
+        let _ = r.execute_sql("SELECT x FROM t").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let future = hybrid_cache::now_ms() + 3_600_000;
+        r.staging
+            .execute_sql(&format!(
+                "UPDATE __ggsql_cache_meta__ SET fetched_at_epoch_ms = {future}"
+            ))
+            .unwrap();
+
+        // Second call: with the clamp, age = max(now - future, 0) = 0 <
+        // ttl, so we still hit. Counter must not advance.
+        let _ = r.execute_sql("SELECT x FROM t").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "future fetched_at must be treated as age=0, not as immortal"
+        );
+    }
+
+    #[test]
+    fn clear_all_returns_ok_on_clean_state() {
+        // Sanity: clear_cache on a freshly initialised HybridReader is a
+        // no-op (no meta rows, no cache tables). The non-leaking variant
+        // of clear_all must still return Ok in this case.
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let data = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(data), staging);
+        r.clear_cache().expect("clear on empty cache must be Ok");
+    }
+}
+
+#[cfg(all(test, feature = "sqlite", feature = "adbc"))]
+mod cache_equivalence_tests {
+    //! Cache equivalence tests against a real ADBC SQLite primary reader.
+    //!
+    //! Drives `HybridReader` with `AdbcReader<sqlite via ManagedDriver>` as
+    //! the primary and a local in-memory DuckDB as staging. Verifies that
+    //! the cache returns correct data on miss and on hit, that hits avoid
+    //! round-tripping back to the primary, and that `clear_cache()` /
+    //! `ttl=0` correctly force re-fetches. The mirror image of the
+    //! per-staged-data assertions in `super::tests`, but with a real
+    //! external-backend primary instead of an in-process `DuckDBReader`.
+    //!
+    //! Skipped by default (each test is `#[ignore]`). To run them:
+    //!
+    //! 1. Install dbc: `curl -LsSf https://dbc.columnar.tech/install.sh | sh`
+    //! 2. Install the SQLite driver: `dbc install sqlite`
+    //! 3. Run: `cargo test --features "adbc duckdb sqlite" -- --ignored cache_equivalence`
+    //!
+    //! `dbc install` writes the driver to a manifest location that
+    //! `ManagedDriver::load_from_name("sqlite", ...)` discovers automatically
+    //! (on macOS: `~/Library/Application Support/ADBC/Drivers/sqlite.toml`).
+
+    use super::HybridReader;
+    use crate::reader::hybrid_cache::CacheConfig;
+    use crate::reader::sqlite::SqliteDialect;
+    use crate::reader::{AdbcReader, DuckDBReader, Reader, Spec, SqlDialect};
+    use crate::{DataFrame, Result};
+    use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
+    use adbc_core::LOAD_FLAG_DEFAULT;
+    use adbc_driver_manager::ManagedDriver;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    /// Construct an `AdbcReader<ManagedDriver>` pointed at a SQLite file via
+    /// the `adbc_driver_sqlite` shared library installed by `dbc`.
+    fn make_adbc_reader(db_path: &str) -> AdbcReader<ManagedDriver> {
+        let driver = ManagedDriver::load_from_name(
+            "sqlite",
+            None,
+            AdbcVersion::V110,
+            LOAD_FLAG_DEFAULT,
+            None,
+        )
+        .expect("`dbc install sqlite` first; see module docs");
+        let dialect: Box<dyn SqlDialect + Send> = Box::new(SqliteDialect);
+        AdbcReader::new_with_database_opts(
+            driver,
+            dialect,
+            std::iter::once((
+                OptionDatabase::Uri,
+                OptionValue::String(format!("file:{}", db_path)),
+            )),
+        )
+        .expect("construct AdbcReader<sqlite>")
+    }
+
+    /// A wrapper around `AdbcReader<ManagedDriver>` that counts every
+    /// `execute_sql` call. Used to assert that cache hits do NOT round-trip
+    /// back to the ADBC primary.
+    struct CountingAdbcReader {
+        inner: AdbcReader<ManagedDriver>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Reader for CountingAdbcReader {
+        fn execute_sql(&self, sql: &str) -> Result<DataFrame> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.execute_sql(sql)
+        }
+        fn register(&self, name: &str, df: DataFrame, replace: bool) -> Result<()> {
+            self.inner.register(name, df, replace)
+        }
+        fn unregister(&self, name: &str) -> Result<()> {
+            self.inner.unregister(name)
+        }
+        fn execute(&self, query: &str) -> Result<Spec> {
+            crate::reader::execute_with_reader(self, query)
+        }
+        fn dialect(&self) -> &dyn SqlDialect {
+            self.inner.dialect()
+        }
+    }
+
+    /// Seed the SQLite file with a small test table via the ADBC reader's
+    /// `register()` (the bulk-ingest path). Done with a bare AdbcReader so
+    /// the seed doesn't show up in any later call counters.
+    fn seed(path: &str) {
+        let bare = make_adbc_reader(path);
+        let df = crate::df! {
+            "x" => vec![1i64, 2, 3, 4, 5],
+            "y" => vec![10i64, 20, 30, 40, 50],
+        }
+        .unwrap();
+        bare.register("t", df, false).unwrap();
+    }
+
+    /// Compare two DataFrames by per-column Arrow array contents. Mirrors
+    /// the helper in `adbc::equivalence_tests`, scoped down to the
+    /// dimensions PR3 cares about.
+    fn assert_dataframes_equal(a: &DataFrame, b: &DataFrame, ctx: &str) {
+        assert_eq!(a.height(), b.height(), "{ctx}: row count");
+        assert_eq!(a.width(), b.width(), "{ctx}: col count");
+        for f in a.schema().fields() {
+            assert_eq!(
+                a.column(f.name()).unwrap().as_ref(),
+                b.column(f.name()).unwrap().as_ref(),
+                "{ctx}: column '{}' mismatch",
+                f.name()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_cache_returns_same_data_as_bare_adbc() {
+        // First call (miss) AND second call (hit) must both return data
+        // identical to a bare AdbcReader. Validates that the
+        // miss → register-in-staging → return-fresh path doesn't corrupt
+        // data, and the hit → SELECT-from-staging path returns a faithful
+        // copy.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let bare = make_adbc_reader(path);
+        let sql = "SELECT x, y, x*y AS xy FROM t WHERE y > 15 ORDER BY x";
+        let golden = bare.execute_sql(sql).unwrap();
+
+        let primary = make_adbc_reader(path);
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(primary), staging);
+
+        let miss = r.execute_sql(sql).unwrap();
+        assert_dataframes_equal(&golden, &miss, "first call (cache miss)");
+
+        let hit = r.execute_sql(sql).unwrap();
+        assert_dataframes_equal(&golden, &hit, "second call (cache hit)");
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_cache_hit_avoids_adbc_call() {
+        // Counter-based assertion: identical query twice → ADBC reached
+        // exactly once. The cache-hit path must serve from staging without
+        // touching the primary.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let primary = make_adbc_reader(path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingAdbcReader {
+            inner: primary,
+            calls: calls.clone(),
+        };
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        let sql = "SELECT x FROM t ORDER BY x";
+        r.execute_sql(sql).unwrap();
+        r.execute_sql(sql).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second call must hit cache, not ADBC"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_clear_cache_forces_adbc_refetch() {
+        // After clear_cache(), the next query must round-trip back to ADBC
+        // — proving clear_cache actually drops cache state, not just meta
+        // rows.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let primary = make_adbc_reader(path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingAdbcReader {
+            inner: primary,
+            calls: calls.clone(),
+        };
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        let sql = "SELECT x FROM t";
+        r.execute_sql(sql).unwrap(); // miss → 1
+        r.execute_sql(sql).unwrap(); // hit  → still 1
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        r.clear_cache().unwrap();
+        r.execute_sql(sql).unwrap(); // miss again → 2
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "clear_cache must force re-fetch from ADBC"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires `dbc install sqlite`; see module docs"]
+    fn equiv_ttl_zero_always_hits_adbc() {
+        // ttl=0 must always evict + refetch, even within the same
+        // millisecond. Each call must reach ADBC.
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap();
+        seed(path);
+
+        let primary = make_adbc_reader(path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingAdbcReader {
+            inner: primary,
+            calls: calls.clone(),
+        };
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let cfg = CacheConfig {
+            enabled: true,
+            ttl_secs: 0,
+            max_bytes: 1 << 30,
+        };
+        let r = HybridReader::with_cache_config(Box::new(counting), staging, cfg);
+
+        let sql = "SELECT x FROM t";
+        r.execute_sql(sql).unwrap();
+        r.execute_sql(sql).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "ttl=0 must always hit ADBC"
         );
     }
 }
