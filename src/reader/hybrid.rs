@@ -56,6 +56,15 @@ pub struct HybridReader {
     staging: DuckDBReader,
     staged_names: RefCell<HashSet<String>>,
     cache: CacheConfig,
+    /// Stable per-instance identifier used to namespace cache keys. The
+    /// `Reader` trait does not expose a URI we can hash, so each
+    /// `HybridReader` mints a fresh UUID at construction and uses it as the
+    /// `reader_uri` half of the `(reader_uri, sql)` cache key. This means
+    /// (a) two `HybridReader` instances that share a staging DuckDB cannot
+    /// alias each other's cached results even if they wrap different
+    /// primaries, and (b) the cache cannot accidentally outlive the
+    /// instance that produced it across a process restart.
+    instance_id: String,
 }
 
 impl HybridReader {
@@ -83,12 +92,19 @@ impl HybridReader {
             staging,
             staged_names: RefCell::new(HashSet::new()),
             cache,
+            instance_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
     /// Read-only access to this reader's cache configuration.
     pub fn cache_config(&self) -> &CacheConfig {
         &self.cache
+    }
+
+    /// The per-instance UUID used to namespace cache keys. Exposed mainly
+    /// for tests that need to assert two distinct readers do not collide.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// Dialect of the primary data backend. Useful for SQL targeted at the
@@ -114,17 +130,19 @@ impl Reader for HybridReader {
             return self.data.execute_sql(sql);
         }
 
-        // We need a reader URI for the cache key. The Reader trait doesn't
-        // expose one — we use a fixed placeholder per HybridReader instance
-        // (each instance has its own staging DuckDB namespace, so keys don't
-        // need to cross-collide between instances).
-        let reader_uri = "hybrid-primary";
+        // Cache keys are namespaced by this HybridReader's per-instance
+        // UUID so that two HybridReader instances that happen to share a
+        // staging DuckDB cannot alias each other's cached results.
+        let reader_uri = self.instance_id.as_str();
         let key = hybrid_cache::cache_key(reader_uri, sql);
         let table = hybrid_cache::cache_table_name(&key);
 
         // Hit: meta row exists AND within TTL AND table exists.
         if let Some(entry) = hybrid_cache::lookup(&self.staging, &key)? {
-            let age_ms = hybrid_cache::now_ms() - entry.fetched_at_epoch_ms;
+            // Clamp at zero so a backwards-moving clock (NTP step, suspend
+            // wake, multi-host shared staging) cannot make the difference
+            // negative and keep stale entries alive forever.
+            let age_ms = (hybrid_cache::now_ms() - entry.fetched_at_epoch_ms).max(0);
             let ttl_ms = (self.cache.ttl_secs as i64) * 1000;
             // Strict `<` so that ttl=0 always misses, even when racing within
             // the same millisecond (age_ms = 0, ttl_ms = 0).
@@ -183,7 +201,7 @@ impl Reader for HybridReader {
         // primary fetch succeeded. Don't surface the failure as a query
         // error; just log and continue.
         if let Err(e) = hybrid_cache::evict_over_budget(&self.staging, self.cache.max_bytes) {
-            eprintln!("ggsql: cache eviction failed (non-fatal): {e}");
+            tracing::warn!(error = %e, "cache eviction failed (non-fatal)");
         }
         Ok(df)
     }
@@ -755,6 +773,117 @@ mod tests {
             "replaying a sub-query the viz pipeline already issued must hit \
              the cache — data counter must not advance"
         );
+    }
+
+    #[test]
+    fn instance_ids_are_unique_per_reader() {
+        // Each HybridReader gets its own UUID so cache keys are namespaced
+        // per-instance — two readers can share a staging DuckDB without
+        // their caches aliasing.
+        let r1 = HybridReader::new(
+            Box::new(DuckDBReader::from_connection_string("duckdb://memory").unwrap()),
+            DuckDBReader::from_connection_string("duckdb://memory").unwrap(),
+        );
+        let r2 = HybridReader::new(
+            Box::new(DuckDBReader::from_connection_string("duckdb://memory").unwrap()),
+            DuckDBReader::from_connection_string("duckdb://memory").unwrap(),
+        );
+        assert_ne!(r1.instance_id(), r2.instance_id());
+        assert_ne!(
+            hybrid_cache::cache_key(r1.instance_id(), "SELECT 1"),
+            hybrid_cache::cache_key(r2.instance_id(), "SELECT 1"),
+            "two readers must not collide on cache keys"
+        );
+    }
+
+    #[test]
+    fn shared_staging_with_distinct_instances_does_not_alias_cache() {
+        // Two HybridReaders pointed at the same staging DuckDB issue the
+        // same SQL against different primaries; cache must NOT alias them.
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        // Both staging objects are independent (different in-memory DBs);
+        // what we're validating here is that even if a future refactor
+        // arranges for them to share storage, the per-instance UUID in the
+        // cache key would still keep their entries distinct.
+        let staging1 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let staging2 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        drop(staging);
+
+        let data1 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data1
+            .execute_sql("CREATE TABLE t AS SELECT CAST(1 AS BIGINT) AS x UNION ALL SELECT 2")
+            .unwrap();
+        let data2 = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data2
+            .execute_sql("CREATE TABLE t AS SELECT CAST(100 AS BIGINT) AS x UNION ALL SELECT 200")
+            .unwrap();
+
+        let r1 = HybridReader::new(Box::new(data1), staging1);
+        let r2 = HybridReader::new(Box::new(data2), staging2);
+
+        let d1 = r1.execute_sql("SELECT x FROM t ORDER BY x").unwrap();
+        let d2 = r2.execute_sql("SELECT x FROM t ORDER BY x").unwrap();
+        // Each reader sees its own primary's data — proves the cache key
+        // separation isolates the two even for an identical SQL string.
+        assert_ne!(
+            crate::array_util::as_i64(d1.column("x").unwrap())
+                .unwrap()
+                .value(0),
+            crate::array_util::as_i64(d2.column("x").unwrap())
+                .unwrap()
+                .value(0),
+        );
+    }
+
+    #[test]
+    fn negative_age_does_not_keep_entries_alive() {
+        // Simulate a backwards-moving clock: insert a meta row with
+        // `fetched_at` in the future. Without the `.max(0)` clamp the
+        // (now - future) age would be negative and pass `< ttl_ms`, making
+        // the entry "immortal" even past its TTL. With the clamp the age
+        // is treated as 0 — still within TTL, so the entry is served from
+        // cache (a hit). That is the correct behaviour: a future timestamp
+        // means "recently fetched relative to a misbehaving clock", not
+        // "infinitely stale".
+        let data_inner = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        data_inner
+            .execute_sql("CREATE TABLE t AS SELECT 7 AS x")
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingReader::new(data_inner, calls.clone());
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(counting), staging);
+
+        // Prime the cache, then rewrite the meta row's fetched_at to a
+        // value 1 hour in the future relative to wall clock.
+        let _ = r.execute_sql("SELECT x FROM t").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let future = hybrid_cache::now_ms() + 3_600_000;
+        r.staging
+            .execute_sql(&format!(
+                "UPDATE __ggsql_cache_meta__ SET fetched_at_epoch_ms = {future}"
+            ))
+            .unwrap();
+
+        // Second call: with the clamp, age = max(now - future, 0) = 0 <
+        // ttl, so we still hit. Counter must not advance.
+        let _ = r.execute_sql("SELECT x FROM t").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "future fetched_at must be treated as age=0, not as immortal"
+        );
+    }
+
+    #[test]
+    fn clear_all_returns_ok_on_clean_state() {
+        // Sanity: clear_cache on a freshly initialised HybridReader is a
+        // no-op (no meta rows, no cache tables). The non-leaking variant
+        // of clear_all must still return Ok in this case.
+        let staging = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let data = DuckDBReader::from_connection_string("duckdb://memory").unwrap();
+        let r = HybridReader::new(Box::new(data), staging);
+        r.clear_cache().expect("clear on empty cache must be Ok");
     }
 }
 

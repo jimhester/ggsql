@@ -2094,6 +2094,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml_edit 0.22.27",
+ "tracing",
  "tree-sitter",
  "tree-sitter-ggsql",
  "ureq",

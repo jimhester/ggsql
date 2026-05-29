@@ -7,10 +7,17 @@ use arrow::array::Array;
 use sha2::{Digest, Sha256};
 
 use crate::array_util::{as_i64, as_str};
+use crate::naming::{quote_ident, quote_literal};
 use crate::reader::{DuckDBReader, Reader};
-use crate::Result;
+use crate::{GgsqlError, Result};
 
 pub const META_TABLE: &str = "__ggsql_cache_meta__";
+
+/// Returns the meta table identifier already wrapped in double quotes,
+/// safe to interpolate directly into a SQL statement.
+fn meta_q() -> String {
+    quote_ident(META_TABLE)
+}
 
 /// Runtime configuration for the query-result cache.
 #[derive(Debug, Clone)]
@@ -44,7 +51,7 @@ impl Default for CacheConfig {
 /// DDL; safe to call on every `HybridReader::new`.
 pub fn ensure_meta(staging: &DuckDBReader) -> Result<()> {
     let ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {META_TABLE} (
+        "CREATE TABLE IF NOT EXISTS {} (
            cache_key             VARCHAR PRIMARY KEY,
            reader_uri            VARCHAR NOT NULL,
            sql                   VARCHAR NOT NULL,
@@ -52,7 +59,8 @@ pub fn ensure_meta(staging: &DuckDBReader) -> Result<()> {
            last_accessed_epoch_ms BIGINT NOT NULL,
            row_count             BIGINT  NOT NULL,
            byte_estimate         BIGINT  NOT NULL
-         )"
+         )",
+        meta_q()
     );
     staging.execute_sql(&ddl).map(|_| ())
 }
@@ -97,25 +105,28 @@ pub struct CacheEntry {
     pub byte_estimate: i64,
 }
 
+/// Wall-clock millis since UNIX epoch. On the (essentially impossible) case
+/// where `SystemTime::now()` is earlier than the UNIX epoch — typically a
+/// misconfigured system clock — we return `i64::MAX` rather than `0`.
+/// Returning 0 would mark every cache entry as freshly stored relative to
+/// the bogus clock, so stale entries would never expire; `i64::MAX` makes
+/// them appear ancient and force a re-fetch on the next access, which is the
+/// safer of the two failure modes for a *correctness*-flavoured cache.
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-// SQL-escape a string for embedding in a DuckDB string literal.
-fn esc(s: &str) -> String {
-    s.replace('\'', "''")
+        .unwrap_or(i64::MAX)
 }
 
 pub fn lookup(staging: &DuckDBReader, key: &str) -> Result<Option<CacheEntry>> {
     let sql = format!(
         "SELECT cache_key, reader_uri, sql, fetched_at_epoch_ms,
                 last_accessed_epoch_ms, row_count, byte_estimate
-         FROM {META_TABLE} WHERE cache_key = '{}'",
-        esc(key)
+         FROM {} WHERE cache_key = {}",
+        meta_q(),
+        quote_literal(key)
     );
     let df = staging.execute_sql(&sql)?;
     if df.height() == 0 {
@@ -170,13 +181,14 @@ pub fn insert_meta(
     // raising a PK conflict on `cache_key`.
     let now = now_ms();
     let dml = format!(
-        "INSERT OR REPLACE INTO {META_TABLE}
+        "INSERT OR REPLACE INTO {}
          (cache_key, reader_uri, sql, fetched_at_epoch_ms,
           last_accessed_epoch_ms, row_count, byte_estimate)
-         VALUES ('{}', '{}', '{}', {}, {}, {}, {})",
-        esc(key),
-        esc(reader_uri),
-        esc(sql),
+         VALUES ({}, {}, {}, {}, {}, {}, {})",
+        meta_q(),
+        quote_literal(key),
+        quote_literal(reader_uri),
+        quote_literal(sql),
         now,
         now,
         row_count,
@@ -187,41 +199,61 @@ pub fn insert_meta(
 
 pub fn touch(staging: &DuckDBReader, key: &str) -> Result<()> {
     let dml = format!(
-        "UPDATE {META_TABLE} SET last_accessed_epoch_ms = {}
-         WHERE cache_key = '{}'",
+        "UPDATE {} SET last_accessed_epoch_ms = {}
+         WHERE cache_key = {}",
+        meta_q(),
         now_ms(),
-        esc(key)
+        quote_literal(key)
     );
     staging.execute_sql(&dml).map(|_| ())
 }
 
 pub fn drop_entry(staging: &DuckDBReader, key: &str) -> Result<()> {
-    let del = format!("DELETE FROM {META_TABLE} WHERE cache_key = '{}'", esc(key));
+    let del = format!(
+        "DELETE FROM {} WHERE cache_key = {}",
+        meta_q(),
+        quote_literal(key)
+    );
     staging.execute_sql(&del)?;
-    let drop = format!("DROP TABLE IF EXISTS {}", cache_table_name(key));
+    let drop = format!(
+        "DROP TABLE IF EXISTS {}",
+        quote_ident(&cache_table_name(key))
+    );
     staging.execute_sql(&drop).map(|_| ())
 }
 
 pub fn clear_all(staging: &DuckDBReader) -> Result<()> {
-    // Find all cache_keys; drop each entry.
-    let df = staging.execute_sql(&format!("SELECT cache_key FROM {META_TABLE}"))?;
-    if df.height() > 0 {
-        let col = df
-            .column("cache_key")
-            .map_err(|e| crate::GgsqlError::ReaderError(format!("clear_all col: {e}")))?;
-        let s = as_str(col)
-            .map_err(|e| crate::GgsqlError::ReaderError(format!("clear_all str: {e}")))?;
-        // Collect keys first to avoid holding borrow during drop_entry mutations.
-        let keys: Vec<String> = (0..s.len())
-            .filter(|&i| !s.is_null(i))
-            .map(|i| s.value(i).to_string())
-            .collect();
-        for k in keys {
-            let _ = drop_entry(staging, &k);
+    // Find all cache_keys, drop each entry. We must NOT blanket-delete the
+    // meta table at the end: if a `DROP TABLE` failed for any key the
+    // corresponding cache table would persist forever with no row in meta
+    // to evict it (a permanent leak). Instead we propagate the first error,
+    // leaving the meta rows for the failing keys in place so a retry can
+    // pick them up.
+    let df = staging.execute_sql(&format!("SELECT cache_key FROM {}", meta_q()))?;
+    if df.height() == 0 {
+        return Ok(());
+    }
+    let col = df
+        .column("cache_key")
+        .map_err(|e| GgsqlError::ReaderError(format!("clear_all col: {e}")))?;
+    let s = as_str(col).map_err(|e| GgsqlError::ReaderError(format!("clear_all str: {e}")))?;
+    let keys: Vec<String> = (0..s.len())
+        .filter(|&i| !s.is_null(i))
+        .map(|i| s.value(i).to_string())
+        .collect();
+    let mut failures: Vec<String> = Vec::new();
+    for k in keys {
+        if let Err(e) = drop_entry(staging, &k) {
+            failures.push(format!("{k}: {e}"));
         }
     }
-    // Defensive final wipe in case stale rows linger.
-    staging.execute_sql(&format!("DELETE FROM {META_TABLE}"))?;
+    if !failures.is_empty() {
+        return Err(GgsqlError::ReaderError(format!(
+            "clear_all: {} cache entries failed to drop: {}",
+            failures.len(),
+            failures.join("; ")
+        )));
+    }
     Ok(())
 }
 
@@ -231,8 +263,10 @@ pub fn evict_over_budget(staging: &DuckDBReader, max_bytes: u64) -> Result<()> {
     // Cast SUM result to BIGINT — DuckDB's SUM over BIGINT promotes to HUGEINT,
     // which the arrow adapter materializes as Float64 (or unsupported type)
     // and would silently break the i64 extractor below.
-    let sum_sql =
-        format!("SELECT CAST(COALESCE(SUM(byte_estimate), 0) AS BIGINT) AS n FROM {META_TABLE}");
+    let sum_sql = format!(
+        "SELECT CAST(COALESCE(SUM(byte_estimate), 0) AS BIGINT) AS n FROM {}",
+        meta_q()
+    );
     loop {
         let df = staging.execute_sql(&sum_sql)?;
         let total = df
@@ -252,8 +286,9 @@ pub fn evict_over_budget(staging: &DuckDBReader, max_bytes: u64) -> Result<()> {
         }
         // Find the single oldest-accessed key.
         let pick = format!(
-            "SELECT cache_key FROM {META_TABLE}
-             ORDER BY last_accessed_epoch_ms ASC LIMIT 1"
+            "SELECT cache_key FROM {}
+             ORDER BY last_accessed_epoch_ms ASC LIMIT 1",
+            meta_q()
         );
         let df = staging.execute_sql(&pick)?;
         if df.height() == 0 {

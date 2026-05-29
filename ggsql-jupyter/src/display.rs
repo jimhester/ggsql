@@ -100,12 +100,27 @@ fn format_connection_changed(display_name: &str) -> Value {
 
 /// Format Vega-Lite visualization as display_data
 fn format_vegalite(spec: String, hints: &RenderHints) -> Value {
-    let html = vegalite_html(&spec, hints);
+    // Parse the spec ONCE up front. If it is not valid JSON we cannot
+    // produce a meaningful Vega-Lite bundle and would only confuse the
+    // notebook frontend by emitting a v5/v6 mime payload that wraps an
+    // `{"error": "..."}` placeholder. Return a plain-text error output in
+    // that case so the failure surfaces cleanly to the user instead of
+    // rendering as a silently broken chart.
+    let spec_value: Value = match serde_json::from_str(&spec) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Failed to parse Vega-Lite JSON: {}", e);
+            return json!({
+                "data": {
+                    "text/plain": format!("ggsql: invalid Vega-Lite spec: {e}")
+                },
+                "metadata": {},
+                "transient": {}
+            });
+        }
+    };
 
-    let spec_value: Value = serde_json::from_str(&spec).unwrap_or_else(|e| {
-        tracing::error!("Failed to parse Vega-Lite JSON: {}", e);
-        json!({"error": "Invalid Vega-Lite JSON"})
-    });
+    let html = vegalite_html(&spec, hints);
 
     // Rewrite the spec's $schema to v5 for the v5 mime bundle so clients
     // that validate the schema URL against the mime version (notably
